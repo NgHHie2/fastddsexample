@@ -52,6 +52,9 @@ public:
     //! Trigger the end of execution
     void stop() override;
 
+    void set_websocket_server(std::shared_ptr<class WebSocketServer> ws_server);
+    bool publish_coordinates(double lon, double lat, int64_t timestamp);
+
 private:
 
     //! Return the current state of execution
@@ -59,7 +62,8 @@ private:
 
     //! Publish a sample
     bool publish();
-
+    
+    std::shared_ptr<class WebSocketServer> ws_server_;
     std::shared_ptr<eprosima::fastdds::dds::DomainParticipantFactory> factory_;
     eprosima::fastdds::dds::DomainParticipant* participant_;
     eprosima::fastdds::dds::Publisher* publisher_;

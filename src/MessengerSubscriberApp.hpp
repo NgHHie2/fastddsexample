@@ -56,12 +56,16 @@ public:
 
     //! Trigger the end of execution
     void stop() override;
+    
+    void set_websocket_server(std::shared_ptr<class WebSocketServer> ws_server);
+
 
 private:
 
     //! Return the current state of execution
     bool is_stopped();
 
+    std::shared_ptr<class WebSocketServer> ws_server_;
     std::shared_ptr<eprosima::fastdds::dds::DomainParticipantFactory> factory_;
     eprosima::fastdds::dds::DomainParticipant* participant_;
     eprosima::fastdds::dds::Subscriber* subscriber_;
