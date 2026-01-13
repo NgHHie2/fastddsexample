@@ -1,6 +1,4 @@
 #include "MessengerPublisherApp.hpp"
-#include "WebSocketServer.hpp"
-#include "CoordinateGenerator.hpp"
 
 #include <condition_variable>
 #include <csignal>
@@ -30,10 +28,9 @@ MessengerPublisherApp::MessengerPublisherApp(
     , type_(new Messenger::MessagePubSubType())
     , matched_(0)
     , samples_sent_(0)
+    , last_published_sequence_(0)
     , stop_(false)
 {
-    //
-
     // Create the participant
     DomainParticipantQos pqos = PARTICIPANT_QOS_DEFAULT;
     pqos.name("Messenger::Message_pub_participant");
@@ -100,7 +97,7 @@ void MessengerPublisherApp::on_publication_matched(
             std::lock_guard<std::mutex> lock(mutex_);
             matched_ = info.current_count;
         }
-        std::cout << "Messenger::Message Publisher matched." << std::endl;
+        std::cout << "[DDS Publisher] Matched with subscriber." << std::endl;
         cv_.notify_one();
     }
     else if (info.current_count_change == -1)
@@ -109,7 +106,7 @@ void MessengerPublisherApp::on_publication_matched(
             std::lock_guard<std::mutex> lock(mutex_);
             matched_ = info.current_count;
         }
-        std::cout << "Messenger::Message Publisher unmatched." << std::endl;
+        std::cout << "[DDS Publisher] Unmatched from subscriber." << std::endl;
     }
     else
     {
@@ -120,48 +117,63 @@ void MessengerPublisherApp::on_publication_matched(
 
 void MessengerPublisherApp::run()
 {
-    CoordinateGenerator coord_gen;
-    
-    std::cout << "[Publisher] Starting coordinate broadcast..." << std::endl;
-    std::cout << "[Publisher] Broadcasting to DDS topic: 'Movie Discussion List'" << std::endl;
-    if (ws_server_) {
-        std::cout << "[Publisher] Broadcasting to WebSocket clients" << std::endl;
+    if (!shared_state_) {
+        std::cerr << "[DDS Publisher] ERROR: Shared state not set!" << std::endl;
+        return;
     }
+    
+    std::cout << "[DDS Publisher] Starting at ~" 
+              << (1000.0 / dds_publish_rate_ms_) << "Hz" << std::endl;
+    std::cout << "[DDS Publisher] Reading from shared coordinate state" << std::endl;
+    
+    // Deadline-based timing để tránh drift
+    auto period = std::chrono::milliseconds(dds_publish_rate_ms_);
+    auto next_deadline = std::chrono::steady_clock::now() + period;
     
     while (!is_stopped())
     {
-        // Lấy tọa độ mới
-        auto coords = coord_gen.get_next_coordinate();
-        auto timestamp = CoordinateGenerator::get_timestamp();
-        
-        if (publish_coordinates(coords.first, coords.second, timestamp))
+        if (publish_from_shared_state())
         {
             samples_sent_++;
-            if (samples_sent_ % 100 == 0) {  // Log mỗi 100 samples
-                std::cout << "[Publisher] Sent " << samples_sent_ 
-                         << " samples. Latest: [" << coords.first 
-                         << ", " << coords.second << "]" << std::endl;
+            if (samples_sent_ % 50 == 0) {  // Log mỗi 50 samples
+                auto latest = shared_state_->get_latest();
+                std::cout << "[DDS Publisher] Sent " << samples_sent_ 
+                         << " samples. Latest seq: " << latest->sequence << std::endl;
             }
         }
         
-        // Delay ~20ms => ~50Hz
+        // Sleep đến deadline tiếp theo (bù trừ thời gian xử lý)
         std::unique_lock<std::mutex> period_lock(mutex_);
-        cv_.wait_for(period_lock, std::chrono::milliseconds(20), [this]()
+        cv_.wait_until(period_lock, next_deadline, [this]()
                 {
                     return is_stopped();
                 });
+        
+        // Cập nhật deadline cho lần tiếp theo
+        next_deadline += period;
+        
+        // Nếu bị trễ quá nhiều, reset deadline
+        auto now = std::chrono::steady_clock::now();
+        if (next_deadline < now - period * 2) {
+            std::cerr << "[DDS Publisher] WARNING: Deadline drift detected, resetting" << std::endl;
+            next_deadline = now + period;
+        }
     }
     
-    std::cout << "[Publisher] Total samples sent: " << samples_sent_ << std::endl;
+    std::cout << "[DDS Publisher] Total samples published: " << samples_sent_ << std::endl;
 }
 
-void MessengerPublisherApp::set_websocket_server(std::shared_ptr<WebSocketServer> ws_server)
+void MessengerPublisherApp::set_shared_state(std::shared_ptr<SharedCoordinateState> state)
 {
-    ws_server_ = ws_server;
+    shared_state_ = state;
 }
 
-bool MessengerPublisherApp::publish_coordinates(double lon, double lat, int64_t timestamp)
+bool MessengerPublisherApp::publish_from_shared_state()
 {
+    if (!shared_state_ || !shared_state_->has_data()) {
+        return false;
+    }
+    
     bool ret = false;
     
     // Wait for the data endpoints discovery
@@ -173,53 +185,29 @@ bool MessengerPublisherApp::publish_coordinates(double lon, double lat, int64_t 
 
     if (!is_stopped())
     {
-        // 1. Gửi qua DDS
+        // Đọc tọa độ mới nhất từ shared state
+        auto coord_data = shared_state_->get_latest();
+        
+        // Chỉ publish nếu có data mới (sequence khác)
+        if (coord_data->sequence <= last_published_sequence_) {
+            return false;
+        }
+        
+        // Tạo DDS message
         Messenger::Message sample_;
         sample_.from("CoordinatePublisher");
         sample_.subject("GPS_Coordinates");
         sample_.subject_id(1);
-        
-        // Format: "lon,lat,timestamp"
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(8) 
-            << lon << "," << lat << "," << timestamp;
-        sample_.text(oss.str());
-        sample_.count(samples_sent_ + 1);
+        sample_.text(coord_data->to_csv());
+        sample_.count(coord_data->sequence);
         
         ret = (RETCODE_OK == writer_->write(&sample_));
         
-        // 2. Gửi qua WebSocket (nếu có)
-        if (ws_server_ && ret && (samples_sent_ % 5 == 0))
-        {
-            std::ostringstream json;
-                    json << "{\"coords\":[" << std::fixed << std::setprecision(8) 
-                        << lon << "," << lat << "],"
-                        << "\"time\":" << timestamp << "}";
-                        
-            ws_server_->broadcast(json.str());
+        if (ret) {
+            last_published_sequence_ = coord_data->sequence;
         }
     }
     
-    return ret;
-}
-
-bool MessengerPublisherApp::publish()
-{
-    bool ret = false;
-    // Wait for the data endpoints discovery
-    std::unique_lock<std::mutex> matched_lock(mutex_);
-    cv_.wait(matched_lock, [&]()
-            {
-                // at least one has been discovered
-                return ((matched_ > 0) || is_stopped());
-            });
-
-    if (!is_stopped())
-    {
-        /* Initialize your structure here */
-        Messenger::Message sample_;
-        ret = (RETCODE_OK == writer_->write(&sample_));
-    }
     return ret;
 }
 

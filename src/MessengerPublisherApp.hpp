@@ -30,6 +30,7 @@
 #include <fastdds/dds/topic/TypeSupport.hpp>
 
 #include "MessengerApplication.hpp"
+#include "SharedCoordinateState.hpp"
 
 class MessengerPublisherApp : public MessengerApplication,
         public eprosima::fastdds::dds::DataWriterListener
@@ -52,18 +53,17 @@ public:
     //! Trigger the end of execution
     void stop() override;
 
-    void set_websocket_server(std::shared_ptr<class WebSocketServer> ws_server);
-    bool publish_coordinates(double lon, double lat, int64_t timestamp);
+    void set_shared_state(std::shared_ptr<SharedCoordinateState> state);
 
 private:
 
     //! Return the current state of execution
     bool is_stopped();
 
-    //! Publish a sample
-    bool publish();
+    //! Publish a sample from shared state
+    bool publish_from_shared_state();
     
-    std::shared_ptr<class WebSocketServer> ws_server_;
+    std::shared_ptr<SharedCoordinateState> shared_state_;
     std::shared_ptr<eprosima::fastdds::dds::DomainParticipantFactory> factory_;
     eprosima::fastdds::dds::DomainParticipant* participant_;
     eprosima::fastdds::dds::Publisher* publisher_;
@@ -73,8 +73,9 @@ private:
     std::condition_variable cv_;
     int32_t matched_;
     std::mutex mutex_;
-    const uint32_t period_ms_ = 100; // in ms
-    uint16_t samples_sent_;
+    const uint32_t dds_publish_rate_ms_ = 50; // DDS publishes at ~20Hz
+    uint32_t samples_sent_;
+    uint32_t last_published_sequence_;
     std::atomic<bool> stop_;
 };
 
